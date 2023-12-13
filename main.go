@@ -2,20 +2,23 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 	"io"
 	"log"
 	"messaging/models"
 	"net/http"
 	"os"
-
-	"github.com/gin-gonic/gin"
-	"github.com/joho/godotenv"
+	"strings"
 )
 
-func sendMediaToFacebook(senderID, mediaURL, mediaType string) error {
+func HandleMediaMessage(senderID, mediaURL, mediaType string) error {
 	payload := models.MessageRequestFacebook{
 		Recipient: struct {
 			ID string `json:"id"`
@@ -27,6 +30,23 @@ func sendMediaToFacebook(senderID, mediaURL, mediaType string) error {
 					URL: mediaURL,
 				},
 			},
+		},
+	}
+
+	return sendToFacebook(payload)
+}
+
+func HandleTextMessage(senderID, messageText string) error {
+	if messageText == "" {
+		return errors.New("message can't be empty")
+	}
+
+	payload := models.MessageRequestFacebookMedia{
+		Recipient: models.Recipient{
+			ID: senderID,
+		},
+		Message: models.MessageContent{
+			Text: messageText,
 		},
 	}
 
@@ -73,23 +93,6 @@ func sendRequestToFacebook(payloadBytes []byte) error {
 	return nil
 }
 
-func sendMessage(senderID, messageText string) error {
-	if messageText == "" {
-		return errors.New("message can't be empty")
-	}
-
-	payload := models.MessageRequestFacebookMedia{
-		Recipient: models.Recipient{
-			ID: senderID,
-		},
-		Message: models.MessageContent{
-			Text: messageText,
-		},
-	}
-
-	return sendToFacebook(payload)
-}
-
 func verifyWebhook(c *gin.Context) {
 	verifyToken := c.Query("hub.verify_token")
 	if verifyToken != os.Getenv("VERIFY_TOKEN") {
@@ -103,14 +106,18 @@ func verifyWebhook(c *gin.Context) {
 }
 
 func handleWebhookEvent(c *gin.Context) {
+	appSecret := os.Getenv("FACEBOOK_APP_SECRET")
+	if !verifyRequestSignature(c, appSecret) {
+		log.Println("Invalid signature")
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
 	var message models.MessageFB
 	if err := json.NewDecoder(c.Request.Body).Decode(&message); err != nil {
 		log.Printf("Error decoding message: %v", err)
 		c.String(http.StatusBadRequest, "Bad Request")
 		return
 	}
-
-	fmt.Println("-----------------------message-----------------------", message)
 
 	for _, entry := range message.Entry {
 		for _, messaging := range entry.Messaging {
@@ -122,37 +129,36 @@ func handleWebhookEvent(c *gin.Context) {
 			senderID := messaging.Sender.ID
 
 			if messaging.Message.Text != "" {
-				textMessage := "🖕🏻🖕🏼🖕🏽🖕🏾🖕🏿:  " + messaging.Message.Text
-				if err := sendMessage(senderID, textMessage); err != nil {
+				textMessage := "▄︻デ══━一💥 :  " + messaging.Message.Text
+				if err := HandleTextMessage(senderID, textMessage); err != nil {
 					log.Printf("Failed to send message: %v", err)
 					continue
 				}
-
 			}
 
 			for _, attachment := range messaging.Message.Attachments {
 				switch attachment.Type {
 				case "image":
 					imageURL := "https://i.gifer.com/Ifph.gif"
-					if err := sendMediaToFacebook(senderID, imageURL, attachment.Type); err != nil {
+					if err := HandleMediaMessage(senderID, imageURL, attachment.Type); err != nil {
 						log.Printf("Failed to send image: %v", err)
 						continue
 					}
 				case "audio":
 					audioURL := attachment.Payload.URL
-					if err := sendMediaToFacebook(senderID, audioURL, attachment.Type); err != nil {
+					if err := HandleMediaMessage(senderID, audioURL, attachment.Type); err != nil {
 						log.Printf("Failed to send audio: %v", err)
 						continue
 					}
 				case "video":
 					videoURL := attachment.Payload.URL
-					if err := sendMediaToFacebook(senderID, videoURL, attachment.Type); err != nil {
+					if err := HandleMediaMessage(senderID, videoURL, attachment.Type); err != nil {
 						log.Printf("Failed to send video: %v", err)
 						continue
 					}
 				case "file":
 					file := attachment.Payload.URL
-					if err := sendMediaToFacebook(senderID, file, attachment.Type); err != nil {
+					if err := HandleMediaMessage(senderID, file, attachment.Type); err != nil {
 						log.Printf("Failed to send file: %v", err)
 						continue
 					}
@@ -169,6 +175,7 @@ func handleWebhookEvent(c *gin.Context) {
 func webhookHandler(c *gin.Context) {
 	if c.Request.Method == http.MethodGet {
 		verifyWebhook(c)
+		return
 	} else if c.Request.Method == http.MethodPost {
 		handleWebhookEvent(c)
 	} else {
@@ -177,11 +184,45 @@ func webhookHandler(c *gin.Context) {
 	}
 }
 
+func verifyRequestSignature(c *gin.Context, appSecret string) bool {
+	signatureHeader := c.GetHeader("X-Hub-Signature")
+	if signatureHeader == "" {
+		log.Println("No signature header found")
+		return false
+	}
+
+	signatureParts := strings.Split(signatureHeader, "=")
+	if len(signatureParts) != 2 {
+		log.Println("Signature does not have the expected format")
+		return false
+	}
+
+	algorithm, signatureHash := signatureParts[0], signatureParts[1]
+	if algorithm != "sha1" {
+		log.Println("Algorithm not supported:", algorithm)
+		return false
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("Error reading body: %v", err)
+		return false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	hmac := hmac.New(sha1.New, []byte(appSecret))
+	hmac.Write(body)
+	expectedHash := hex.EncodeToString(hmac.Sum(nil))
+
+	return signatureHash == expectedHash
+}
+
 func main() {
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
+	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 
 	router.Any("/", webhookHandler)
